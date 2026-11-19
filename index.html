@@ -128,8 +128,10 @@ svg{display:block}
 .btnrow button{flex:1;background:var(--card);padding:13px;border-radius:12px;font-weight:600}
 .note{color:var(--mut);font-size:12.5px;margin-top:14px}
 #selBar{position:absolute;left:0;right:0;bottom:0;padding:12px calc(16px + var(--sr)) calc(12px + var(--sb)) calc(16px + var(--sl));display:flex;gap:10px;align-items:center;background:rgba(20,20,22,.96);border-top:1px solid var(--line)}
-#selBar span{flex:1;color:var(--mut)}
-#selBar button{background:var(--card);padding:10px 16px;border-radius:10px;font-weight:600}
+#selBar span{flex:1;color:var(--mut);font-size:13px;min-width:0}
+#selBar button{background:var(--card);padding:10px 12px;border-radius:10px;font-weight:600;font-size:14px;white-space:nowrap}
+#selBar #selSave{background:#fff;color:#000}
+.libtop{display:flex;gap:8px;flex-wrap:wrap}
 
 /* ---------- Sheet / Dialog ---------- */
 #sheetWrap{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:40;display:flex;align-items:flex-end;justify-content:center;animation:fade .2s}
@@ -181,6 +183,7 @@ svg{display:block}
     <div class="pbody" id="libBody">
       <div class="row">
         <button class="primary" data-act="import"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>Hinzufügen</button>
+        <button class="primary" id="saveAllBtn" style="background:var(--card);color:#fff">⤓ Alle sichern/teilen</button>
       </div>
       <div class="stats" id="stats"></div>
       <div id="grid"></div>
@@ -199,7 +202,7 @@ svg{display:block}
       <div class="btnrow"><button class="danger" id="wipeBtn">Alles löschen</button></div>
       <p class="note">Alles bleibt in diesem Browser auf deinem Gerät – nichts wird hochgeladen. Wenn du die Browserdaten löschst, ist auch die Mediathek weg. Tipp: Doppeltippen im Feed = Favorit.</p>
     </div>
-    <div id="selBar" hidden><span id="selCount">0 ausgewählt</span><button id="selSave">⤓ Sichern</button><button id="selFav">♥</button><button id="selDel" class="danger">Löschen</button></div>
+    <div id="selBar" hidden><span id="selCount">0</span><button id="selAll">Alle</button><button id="selSave">⤓ Sichern/Teilen</button><button id="selFav">♥</button><button id="selDel" class="danger">Löschen</button></div>
   </section>
 
   <div id="sheetWrap" hidden><div id="sheet"></div></div>
@@ -439,7 +442,7 @@ function closeLib(){setSelecting(false);$('#lib').hidden=true;if(cur>=0)activate
 $('#libBtn').addEventListener('click',openLib);$('#libClose').addEventListener('click',closeLib);
 function setSelecting(v){selecting=v;sel.clear();$('#grid').classList.toggle('selecting',v);$('#selBtn').textContent=v?'Fertig':'Auswählen';$('#selBar').hidden=!v;updSel();$$('.cell').forEach(c=>c.classList.remove('sel'))}
 $('#selBtn').addEventListener('click',()=>setSelecting(!selecting));
-function updSel(){$('#selCount').textContent=sel.size+' ausgewählt'}
+function updSel(){$('#selCount').textContent=sel.size+' ausgew.';const all=items.length&&sel.size===items.length;const b=$('#selAll');if(b)b.textContent=all?'Keine':'Alle'}
 function renderGrid(){
   const g=$('#grid');const list=items.slice().sort((a,b)=>b.added-a.added);
   g.innerHTML=list.map(m=>{const u=thumbUrl(m);return `<div class="cell${sel.has(m.id)?' sel':''}" data-id="${esc(m.id)}">${u?`<img src="${u}" alt="" loading="lazy">`:`<div class="ph">${esc(m.name)}</div>`}
@@ -455,9 +458,11 @@ $('#grid').addEventListener('click',e=>{const c=e.target.closest('.cell');if(!c)
   const m=byId.get(id);if(!m)return;
   if(!poolIds().includes(id)){filter='all';$$('.chip').forEach(x=>x.classList.toggle('on',x.dataset.f==='all'))}
   $('#lib').hidden=true;resetFeed(id)});
+$('#selAll').addEventListener('click',()=>{const all=sel.size===items.length;sel.clear();if(!all)items.forEach(m=>sel.add(m.id));$$('.cell').forEach(c=>c.classList.toggle('sel',sel.has(c.dataset.id)));updSel()});
 $('#selSave').addEventListener('click',()=>{if(sel.size)saveItems([...sel])});
 $('#selFav').addEventListener('click',()=>{if(!sel.size)return;const allFav=[...sel].every(id=>byId.get(id).fav);[...sel].forEach(id=>toggleFav(id,!allFav));setSelecting(false);renderGrid()});
 $('#selDel').addEventListener('click',async()=>{if(!sel.size)return;const n=sel.size;if(await confirmBox(`${n} ${n===1?'Datei':'Dateien'} löschen?`,'Sie werden aus der App entfernt. Die Originale auf deinem Gerät bleiben erhalten.','Löschen'))await removeItems([...sel]);setSelecting(false)});
+$('#saveAllBtn').addEventListener('click',()=>{if(!items.length){toast('Noch nichts in der Mediathek');return}saveItems(items.map(m=>m.id))});
 $('#wipeBtn').addEventListener('click',async()=>{if(!items.length)return;if(await confirmBox('Alles löschen?','Alle Videos und Fotos werden aus der App entfernt.','Alles löschen'))await removeItems(items.map(m=>m.id))});
 async function removeItems(ids){try{await DB.del(ids)}catch(e){toast('Löschen fehlgeschlagen');return}
   const set=new Set(ids);items=items.filter(m=>!set.has(m.id));ids.forEach(id=>{byId.delete(id);const u=thumbUrls.get(id);if(u){URL.revokeObjectURL(u);thumbUrls.delete(id)}});
