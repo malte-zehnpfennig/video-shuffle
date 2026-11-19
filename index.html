@@ -479,16 +479,118 @@ function confirmBox(title,text,ok){return new Promise(res=>{openSheet(`<h3>${esc
   const fin=v=>{closeSheet();res(v)};$('#cNo').onclick=()=>fin(false);$('#cOk').onclick=()=>fin(true);$('#sheetWrap').onclick=e=>{if(e.target.id==='sheetWrap'){$('#sheetWrap').onclick=null;fin(false)}}})}
 /* ---------- Sichern / Herunterladen ---------- */
 async function filesFor(ids){const out=[];for(const id of ids){const m=byId.get(id);if(!m)continue;let b;try{b=await DB.blob(id)}catch(e){}if(!b)continue;
-  const type=b.type||m.type||(m.kind==='video'?'video/mp4':'image/jpeg');try{out.push(new File([b],m.name||('shuffle-'+id),{type,lastModified:m.modified||Date.now()}))}catch(e){out.push(Object.assign(b,{name:m.name}))}}return out}
-function downloadFiles(files){files.forEach((f,i)=>setTimeout(()=>{const u=URL.createObjectURL(f);const a=document.createElement('a');a.href=u;a.download=f.name||'datei';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(u),60000)},i*400))}
+  // Original-Datei direkt weitergeben (keine Kopie, volle Qualität)
+  if(typeof File!=='undefined'&&b instanceof File&&b.name&&b.type){out.push(b);continue}
+  const type=b.type||m.type||(m.kind==='video'?'video/mp4':'image/jpeg');try{out.push(new File([b],m.name||('shuffle-'+id),{type,lastModified:m.modified||Date.now()}))}catch(e){out.push(b)}}return out}
+function downloadFiles(files){files.forEach((f,i)=>setTimeout(()=>{const u=URL.createObjectURL(f);const a=document.createElement('a');a.href=u;a.download=f.name||'datei';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(u),120000)},i*600))}
 async function shareFiles(files){try{await navigator.share({files});return 'ok'}catch(e){return e&&e.name==='AbortError'?'abort':(e&&e.name==='NotAllowedError'?'gesture':'fail')}}
+// iOS stürzt ab, wenn man Gigabytes auf einmal teilt – deshalb in Portionen
+const BATCH_BYTES=300e6, BATCH_COUNT=15;
+function makeBatches(ids){const out=[];let curB=[],sz=0;for(const id of ids){const m=byId.get(id);if(!m)continue;const z=m.size||0;
+  if(curB.length&&(sz+z>BATCH_BYTES||curB.length>=BATCH_COUNT)){out.push(curB);curB=[];sz=0}curB.push(id);sz+=z}if(curB.length)out.push(curB);return out}
+const batchSize=b=>b.reduce((a,id)=>a+((byId.get(id)||{}).size||0),0);
+let batchRun=0;
 async function saveItems(ids){
-  const files=await filesFor(ids);if(!files.length){toast('Nichts zum Sichern gefunden');return}
-  const canShare=!!(navigator.canShare&&navigator.canShare({files}));
-  if(canShare){const r=await shareFiles(files);if(r==='ok'||r==='abort')return;
-    if(r==='gesture'){openSheet(`<h3>${files.length} ${files.length===1?'Datei':'Dateien'} bereit</h3><p>Tippe auf „Teilen“ und wähle dann „Video sichern“ / „Bild sichern“ (Fotos) oder „In Dateien sichern“.</p><div class="btnrow"><button id="shNo">Abbrechen</button><button id="shGo">Teilen</button></div>`);
-      $('#shNo').onclick=closeSheet;$('#shGo').onclick=()=>{closeSheet();shareFiles(files).then(x=>{if(x==='fail')downloadFiles(files)})};$('#sheetWrap').onclick=e=>{if(e.target.id==='sheetWrap')closeSheet()};return}}
-  downloadFiles(files);toast(files.length>1?'Downloads gestartet':'Download gestartet')}
+  if(cur>=0)deactivate(cur);
+  const batches=makeBatches(ids);if(!batches.length){toast('Nichts zum Sichern gefunden');return}
+  const shareOK=!!(navigator.share&&navigator.canShare);
+  if(batches.length===1&&shareOK){
+    const files=await filesFor(batches[0]);if(!files.length){toast('Nichts zum Sichern gefunden');return}
+    if(navigator.canShare({files})){const r=await shareFiles(files);if(r==='ok'||r==='abort')return;
+      if(r==='gesture'){runBatches(batches,0,++batchRun,files);return}}
+    downloadFiles(files);toast('Download gestartet');return}
+  const total=ids.reduce((a,id)=>a+((byId.get(id)||{}).size||0),0);
+  openSheet(`<h3>${ids.length} Dateien sichern (${fmtSize(total)})</h3>
+    <p><b>Als ZIP</b>: alles in eine Datei gepackt, in Originalqualität. Ein Tipp zum Start, einer zum Speichern („In Dateien sichern“).</p>
+    <p><b>Direkt in Fotos</b>: in ${batches.length} Portionen, für jede ein Tipp.</p>
+    <div class="btnrow"><button id="cZip" style="background:#fff;color:#000">Als ZIP</button></div>
+    <div class="btnrow"><button id="cBatch">Direkt in Fotos</button><button id="cNo">Abbrechen</button></div>`);
+  $('#cZip').onclick=()=>buildZip(ids);
+  $('#cBatch').onclick=()=>runBatches(batches,0,++batchRun,null);
+  $('#cNo').onclick=closeSheet;
+}
+/* ---------- ZIP (ohne Kompression, ZIP64, Dateien werden nur referenziert – keine Kopie im Speicher) ---------- */
+const CRC_T=(()=>{const t=new Uint32Array(256);for(let n=0;n<256;n++){let c=n;for(let k=0;k<8;k++)c=c&1?0xEDB88320^(c>>>1):c>>>1;t[n]=c>>>0}return t})();
+async function crc32Blob(blob,onBytes,isCancelled){let c=0xFFFFFFFF;
+  if(blob.stream){const r=blob.stream().getReader();for(;;){const {done,value}=await r.read();if(done)break;if(isCancelled()){try{r.cancel()}catch(e){}throw new Error('cancel')}
+    for(let i=0;i<value.length;i++)c=CRC_T[(c^value[i])&255]^(c>>>8);onBytes(value.length)}}
+  else{const CH=8<<20;for(let o=0;o<blob.size;o+=CH){if(isCancelled())throw new Error('cancel');const v=new Uint8Array(await blob.slice(o,o+CH).arrayBuffer());for(let i=0;i<v.length;i++)c=CRC_T[(c^v[i])&255]^(c>>>8);onBytes(v.length)}}
+  return (c^0xFFFFFFFF)>>>0}
+function dosTime(t){const d=new Date(t||Date.now());return{time:(d.getHours()<<11)|(d.getMinutes()<<5)|(Math.floor(d.getSeconds()/2)),date:(Math.max(0,d.getFullYear()-1980)<<9)|((d.getMonth()+1)<<5)|d.getDate()}}
+let zipRun=0;
+async function buildZip(ids){
+  const run=++zipRun;let cancelled=false;const isC=()=>cancelled||run!==zipRun;
+  const total=ids.reduce((a,id)=>a+((byId.get(id)||{}).size||0),0);let doneB=0;
+  openSheet(`<h3>Packe ZIP …</h3><p id="zTxt">Starte …</p><div style="height:6px;border-radius:3px;background:rgba(255,255,255,.15);overflow:hidden;margin:10px 0 4px"><i id="zBar" style="display:block;height:100%;width:0;background:#fff"></i></div><p style="font-size:12.5px">Lass die App dabei geöffnet und den Bildschirm an.</p><div class="btnrow"><button id="zNo">Abbrechen</button></div>`);
+  $('#sheetWrap').onclick=null;$('#zNo').onclick=()=>{cancelled=true;closeSheet()};
+  const enc=new TextEncoder(),parts=[],central=[],used=new Set();let offset=0,count=0;
+  try{
+    for(let k=0;k<ids.length;k++){
+      const m=byId.get(ids[k]);if(!m)continue;let b;try{b=await DB.blob(ids[k])}catch(e){}if(!b)continue;if(isC())return;
+      let name=(m.name||('datei-'+k)).replace(/[\/:*?"<>|]/g,'_');
+      if(used.has(name.toLowerCase())){const dot=name.lastIndexOf('.');const base=dot>0?name.slice(0,dot):name,ext=dot>0?name.slice(dot):'';let n=2;while(used.has((base+' ('+n+')'+ext).toLowerCase()))n++;name=base+' ('+n+')'+ext}
+      used.add(name.toLowerCase());
+      const txt=$('#zTxt');if(txt)txt.textContent=`Datei ${k+1} von ${ids.length} · ${fmtSize(doneB)} / ${fmtSize(total)}`;
+      const crc=await crc32Blob(b,n=>{doneB+=n;const bar=$('#zBar');if(bar)bar.style.width=(total?doneB/total*100:0)+'%'},isC);
+      const nb=enc.encode(name),size=BigInt(b.size),{time,date}=dosTime(m.modified||m.added);
+      const lh=new DataView(new ArrayBuffer(30+nb.length+20));
+      lh.setUint32(0,0x04034b50,true);lh.setUint16(4,45,true);lh.setUint16(6,0x0800,true);lh.setUint16(8,0,true);lh.setUint16(10,time,true);lh.setUint16(12,date,true);
+      lh.setUint32(14,crc,true);lh.setUint32(18,0xFFFFFFFF,true);lh.setUint32(22,0xFFFFFFFF,true);lh.setUint16(26,nb.length,true);lh.setUint16(28,20,true);
+      new Uint8Array(lh.buffer).set(nb,30);const e=30+nb.length;lh.setUint16(e,1,true);lh.setUint16(e+2,16,true);lh.setBigUint64(e+4,size,true);lh.setBigUint64(e+12,size,true);
+      parts.push(lh.buffer,b);
+      const ch=new DataView(new ArrayBuffer(46+nb.length+28));
+      ch.setUint32(0,0x02014b50,true);ch.setUint16(4,45,true);ch.setUint16(6,45,true);ch.setUint16(8,0x0800,true);ch.setUint16(10,0,true);ch.setUint16(12,time,true);ch.setUint16(14,date,true);
+      ch.setUint32(16,crc,true);ch.setUint32(20,0xFFFFFFFF,true);ch.setUint32(24,0xFFFFFFFF,true);ch.setUint16(28,nb.length,true);ch.setUint16(30,28,true);ch.setUint16(32,0,true);
+      ch.setUint16(34,0,true);ch.setUint16(36,0,true);ch.setUint32(38,0,true);ch.setUint32(42,0xFFFFFFFF,true);
+      new Uint8Array(ch.buffer).set(nb,46);const f=46+nb.length;ch.setUint16(f,1,true);ch.setUint16(f+2,24,true);ch.setBigUint64(f+4,size,true);ch.setBigUint64(f+12,size,true);ch.setBigUint64(f+20,BigInt(offset),true);
+      central.push(ch.buffer);offset+=lh.byteLength+b.size;count++;
+    }
+    if(isC())return;if(!count){closeSheet();toast('Nichts zum Packen gefunden');return}
+    const cdStart=offset;let cdSize=0;central.forEach(c=>cdSize+=c.byteLength);
+    const z=new DataView(new ArrayBuffer(56+20+22));
+    z.setUint32(0,0x06064b50,true);z.setBigUint64(4,44n,true);z.setUint16(12,45,true);z.setUint16(14,45,true);z.setUint32(16,0,true);z.setUint32(20,0,true);
+    z.setBigUint64(24,BigInt(count),true);z.setBigUint64(32,BigInt(count),true);z.setBigUint64(40,BigInt(cdSize),true);z.setBigUint64(48,BigInt(cdStart),true);
+    z.setUint32(56,0x07064b50,true);z.setUint32(60,0,true);z.setBigUint64(64,BigInt(cdStart+cdSize),true);z.setUint32(72,1,true);
+    z.setUint32(76,0x06054b50,true);z.setUint16(80,0,true);z.setUint16(82,0,true);z.setUint16(84,0xFFFF,true);z.setUint16(86,0xFFFF,true);z.setUint32(88,0xFFFFFFFF,true);z.setUint32(92,0xFFFFFFFF,true);z.setUint16(96,0,true);
+    const d=new Date(),stamp=d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+    const zipFile=new File([...parts,...central,z.buffer],`Shuffle-${stamp}.zip`,{type:'application/zip'});
+    zipReady(zipFile,count);
+  }catch(e){if(e&&e.message==='cancel')return;closeSheet();toast('ZIP konnte nicht erstellt werden',3500)}
+}
+function zipReady(file,count){
+  const canShare=!!(navigator.share&&navigator.canShare&&navigator.canShare({files:[file]}));
+  openSheet(`<h3>ZIP bereit</h3><p>${count} Dateien · ${fmtSize(file.size)} · Originalqualität</p>
+    <p>${canShare?'Tippe auf „Teilen“ → „In Dateien sichern“. In der Dateien-App die ZIP antippen, dann wird sie entpackt. Um alles in Fotos zu bekommen: dort alle auswählen → Teilen → „Videos sichern“.':'Die ZIP wird heruntergeladen.'}</p>
+    <div class="btnrow"><button id="zClose">Schließen</button>${canShare?'<button id="zDl">Herunterladen</button>':''}<button id="zGo" style="background:#fff;color:#000">${canShare?'Teilen':'Herunterladen'}</button></div>`);
+  $('#sheetWrap').onclick=null;
+  $('#zClose').onclick=closeSheet;
+  if($('#zDl'))$('#zDl').onclick=()=>downloadFiles([file]);
+  $('#zGo').onclick=async()=>{if(!canShare){downloadFiles([file]);return}const r=await shareFiles([file]);if(r==='ok')closeSheet();else if(r==='fail'){toast('Teilen fehlgeschlagen – versuche „Herunterladen“',3500)}};
+}
+async function runBatches(batches,i,run,prepared){
+  if(run!==batchRun)return;
+  const n=batches.length,ids=batches[i];
+  openSheet(`<h3>${n>1?`Teil ${i+1} von ${n}`:'Bereit'}</h3><p>Bereite ${ids.length} ${ids.length===1?'Datei':'Dateien'} vor (${fmtSize(batchSize(ids))}) …</p>`);
+  $('#sheetWrap').onclick=null;
+  let files=prepared||await filesFor(ids);
+  if(run!==batchRun)return;
+  const canShare=!!(navigator.share&&navigator.canShare&&files.length&&navigator.canShare({files}));
+  const next=()=>{files=null;if(i+1<n)runBatches(batches,i+1,run,null);else{closeSheet();toast(n>1?`Fertig – alle ${n} Teile`:'Fertig')}};
+  openSheet(`<h3>${n>1?`Teil ${i+1} von ${n}`:'Bereit'}</h3>
+    <p>${files.length} ${files.length===1?'Datei':'Dateien'} · ${fmtSize(batchSize(ids))}</p>
+    <p>${canShare?'Tippe auf „Teilen“ und wähle „Videos/Bilder sichern“ (Fotos-App), „In Dateien sichern“ oder z. B. AirDrop.':'Die Dateien werden heruntergeladen.'}${n>1?' Danach geht es mit dem nächsten Teil weiter.':''}</p>
+    <div class="btnrow"><button id="bStop">${n>1?'Stopp':'Abbrechen'}</button>${n>1&&i+1<n?'<button id="bSkip">Überspringen</button>':''}<button id="bGo" style="background:#fff;color:#000">${canShare?'Teilen':'Herunterladen'}</button></div>`);
+  $('#bStop').onclick=()=>{batchRun++;files=null;closeSheet()};
+  if($('#bSkip'))$('#bSkip').onclick=next;
+  $('#bGo').onclick=async()=>{
+    if(!canShare){downloadFiles(files);next();return}
+    const r=await shareFiles(files);   // direkt im Tipp aufrufen, sonst blockiert iOS
+    if(run!==batchRun)return;
+    if(r==='ok')next();
+    else if(r==='abort'){$('#bGo').textContent='Nochmal teilen'}
+    else{downloadFiles(files);next()}
+  };
+}
 function showInfo(id){const m=byId.get(id);if(!m)return;const wasPlaying=(()=>{const st=mounted.get(cur);return st&&st.el&&st.el.tagName==='VIDEO'&&!st.el.paused})();
   openSheet(`<h3>${esc(m.name)}</h3><dl>
    <dt>Typ</dt><dd>${m.kind==='video'?'Video':'Foto'}${m.type?' ('+esc(m.type)+')':''}</dd>
