@@ -193,13 +193,13 @@ svg{display:block}
       <div class="setting"><div class="lbl">Fotos automatisch weiter nach</div>
         <div class="seg" data-k="photoSec"><button data-v="3">3 s</button><button data-v="5">5 s</button><button data-v="10">10 s</button><button data-v="0">Nie</button></div></div>
       <div class="setting"><div class="lbl">Dateiname</div>
-        <div class="seg" data-k="name"><button data-v="auto">Automatisch ausblenden</button><button data-v="always">Immer zeigen</button></div></div>
+        <div class="seg" data-k="name"><button data-v="tap">Nur beim Tippen</button><button data-v="auto">Kurz einblenden</button><button data-v="always">Immer</button></div></div>
 
       <div class="sect">Speicher</div>
       <div class="btnrow"><button class="danger" id="wipeBtn">Alles löschen</button></div>
       <p class="note">Alles bleibt in diesem Browser auf deinem Gerät – nichts wird hochgeladen. Wenn du die Browserdaten löschst, ist auch die Mediathek weg. Tipp: Doppeltippen im Feed = Favorit.</p>
     </div>
-    <div id="selBar" hidden><span id="selCount">0 ausgewählt</span><button id="selFav">♥ Favorit</button><button id="selDel" class="danger">Löschen</button></div>
+    <div id="selBar" hidden><span id="selCount">0 ausgewählt</span><button id="selSave">⤓ Sichern</button><button id="selFav">♥</button><button id="selDel" class="danger">Löschen</button></div>
   </section>
 
   <div id="sheetWrap" hidden><div id="sheet"></div></div>
@@ -245,10 +245,10 @@ function kindOf(f){
 }
 
 /* ---------- Settings ---------- */
-const DEF={fit:'contain',end:'next',photoSec:5,name:'auto'};
+const DEF={fit:'contain',end:'next',photoSec:5,name:'tap'};
 let S=Object.assign({},DEF);
-try{Object.assign(S,JSON.parse(localStorage.getItem('lvs-settings2')||'{}'))}catch(e){}
-const saveS=()=>{try{localStorage.setItem('lvs-settings2',JSON.stringify(S))}catch(e){}};
+try{Object.assign(S,JSON.parse(localStorage.getItem('lvs-settings3')||'{}'))}catch(e){}
+const saveS=()=>{try{localStorage.setItem('lvs-settings3',JSON.stringify(S))}catch(e){}};
 let filter='all';
 try{filter=localStorage.getItem('lvs-filter')||'all'}catch(e){}
 
@@ -367,7 +367,7 @@ function activate(i){
   const s=slideEl(i),st=mounted.get(i);if(!s)return;
   const m=byId.get(queue[i]);
   const sm=s.querySelector('.name small');if(m)sm.textContent=(m.kind==='video'?(m.duration?fmtTime(m.duration)+' · ':'')+'Video':'Foto')+' · '+fmtSize(m.size);
-  showUI(s,true);updMuteBtn();
+  if(S.name==='auto')showUI(s,true);else{clearTimeout(uiT);s.classList.remove('ui')}updMuteBtn();
   if(!st||!st.el)return;
   s.classList.remove('paused');
   if(st.el.tagName==='VIDEO')playVideo(st.el,s);else startPhoto(s);
@@ -455,6 +455,7 @@ $('#grid').addEventListener('click',e=>{const c=e.target.closest('.cell');if(!c)
   const m=byId.get(id);if(!m)return;
   if(!poolIds().includes(id)){filter='all';$$('.chip').forEach(x=>x.classList.toggle('on',x.dataset.f==='all'))}
   $('#lib').hidden=true;resetFeed(id)});
+$('#selSave').addEventListener('click',()=>{if(sel.size)saveItems([...sel])});
 $('#selFav').addEventListener('click',()=>{if(!sel.size)return;const allFav=[...sel].every(id=>byId.get(id).fav);[...sel].forEach(id=>toggleFav(id,!allFav));setSelecting(false);renderGrid()});
 $('#selDel').addEventListener('click',async()=>{if(!sel.size)return;const n=sel.size;if(await confirmBox(`${n} ${n===1?'Datei':'Dateien'} löschen?`,'Sie werden aus der App entfernt. Die Originale auf deinem Gerät bleiben erhalten.','Löschen'))await removeItems([...sel]);setSelecting(false)});
 $('#wipeBtn').addEventListener('click',async()=>{if(!items.length)return;if(await confirmBox('Alles löschen?','Alle Videos und Fotos werden aus der App entfernt.','Alles löschen'))await removeItems(items.map(m=>m.id))});
@@ -471,6 +472,18 @@ function closeSheet(){$('#sheetWrap').hidden=true}
 $('#sheetWrap').addEventListener('click',e=>{if(e.target.id==='sheetWrap')closeSheet()});
 function confirmBox(title,text,ok){return new Promise(res=>{openSheet(`<h3>${esc(title)}</h3><p>${esc(text)}</p><div class="btnrow"><button id="cNo">Abbrechen</button><button id="cOk" class="danger">${esc(ok)}</button></div>`);
   const fin=v=>{closeSheet();res(v)};$('#cNo').onclick=()=>fin(false);$('#cOk').onclick=()=>fin(true);$('#sheetWrap').onclick=e=>{if(e.target.id==='sheetWrap'){$('#sheetWrap').onclick=null;fin(false)}}})}
+/* ---------- Sichern / Herunterladen ---------- */
+async function filesFor(ids){const out=[];for(const id of ids){const m=byId.get(id);if(!m)continue;let b;try{b=await DB.blob(id)}catch(e){}if(!b)continue;
+  const type=b.type||m.type||(m.kind==='video'?'video/mp4':'image/jpeg');try{out.push(new File([b],m.name||('shuffle-'+id),{type,lastModified:m.modified||Date.now()}))}catch(e){out.push(Object.assign(b,{name:m.name}))}}return out}
+function downloadFiles(files){files.forEach((f,i)=>setTimeout(()=>{const u=URL.createObjectURL(f);const a=document.createElement('a');a.href=u;a.download=f.name||'datei';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(u),60000)},i*400))}
+async function shareFiles(files){try{await navigator.share({files});return 'ok'}catch(e){return e&&e.name==='AbortError'?'abort':(e&&e.name==='NotAllowedError'?'gesture':'fail')}}
+async function saveItems(ids){
+  const files=await filesFor(ids);if(!files.length){toast('Nichts zum Sichern gefunden');return}
+  const canShare=!!(navigator.canShare&&navigator.canShare({files}));
+  if(canShare){const r=await shareFiles(files);if(r==='ok'||r==='abort')return;
+    if(r==='gesture'){openSheet(`<h3>${files.length} ${files.length===1?'Datei':'Dateien'} bereit</h3><p>Tippe auf „Teilen“ und wähle dann „Video sichern“ / „Bild sichern“ (Fotos) oder „In Dateien sichern“.</p><div class="btnrow"><button id="shNo">Abbrechen</button><button id="shGo">Teilen</button></div>`);
+      $('#shNo').onclick=closeSheet;$('#shGo').onclick=()=>{closeSheet();shareFiles(files).then(x=>{if(x==='fail')downloadFiles(files)})};$('#sheetWrap').onclick=e=>{if(e.target.id==='sheetWrap')closeSheet()};return}}
+  downloadFiles(files);toast(files.length>1?'Downloads gestartet':'Download gestartet')}
 function showInfo(id){const m=byId.get(id);if(!m)return;const wasPlaying=(()=>{const st=mounted.get(cur);return st&&st.el&&st.el.tagName==='VIDEO'&&!st.el.paused})();
   openSheet(`<h3>${esc(m.name)}</h3><dl>
    <dt>Typ</dt><dd>${m.kind==='video'?'Video':'Foto'}${m.type?' ('+esc(m.type)+')':''}</dd>
@@ -479,10 +492,11 @@ function showInfo(id){const m=byId.get(id);if(!m)return;const wasPlaying=(()=>{c
    <dt>Größe</dt><dd>${fmtSize(m.size)}</dd>
    <dt>Erstellt</dt><dd>${fmtDate(m.modified)}</dd>
    <dt>Hinzugefügt</dt><dd>${fmtDate(m.added)}</dd></dl>
+   <div class="btnrow"><button id="iSave">⤓ Sichern / Herunterladen</button></div>
    <div class="btnrow"><button id="iFav">${m.fav?'♥ Aus Favoriten':'♡ Zu Favoriten'}</button><button id="iDel" class="danger">Löschen</button></div>
    <div class="btnrow"><button id="iClose">Schließen</button></div>`);
   $('#sheetWrap').onclick=e=>{if(e.target.id==='sheetWrap')closeSheet()};
-  $('#iFav').onclick=()=>{toggleFav(id);closeSheet()};$('#iClose').onclick=closeSheet;
+  $('#iSave').onclick=()=>saveItems([id]);$('#iFav').onclick=()=>{toggleFav(id);closeSheet()};$('#iClose').onclick=closeSheet;
   $('#iDel').onclick=async()=>{if(await confirmBox('Löschen?',`„${m.name}“ wird aus der App entfernt.`,'Löschen'))removeItems([id])};
   void wasPlaying;}
 
