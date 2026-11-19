@@ -526,7 +526,7 @@ async function saveItems(ids){
     downloadFiles(files);toast('Download gestartet');return}
   const total=ids.reduce((a,id)=>a+((byId.get(id)||{}).size||0),0);
   openSheet(`<h3>${ids.length} Dateien sichern (${fmtSize(total)})</h3>
-    <p><b>Eine ZIP</b>: alles in einer Datei, Originalqualität. Danach ein Tipp → „In Dateien sichern“.</p>
+    <p><b>Eine ZIP</b>: alles in einer Datei, Originalqualität. Danach ein Tipp zum Herunterladen.</p>
     <p><b>ZIPs unter 2 GB</b>: automatisch aufgeteilt (ca. ${Math.max(1,Math.ceil(total/1.95e9))} Stück), pro ZIP ein Tipp.</p>
     <p><b>Direkt in Fotos</b>: in ${batches.length} Portionen, für jede ein Tipp.</p>
     <div class="btnrow"><button id="cZip" style="background:#fff;color:#000">Eine ZIP</button><button id="cZip2">ZIPs unter 2 GB</button></div>
@@ -602,19 +602,15 @@ async function buildZip(ids,limit){const partLimit=limit||Infinity;
   }catch(e){if(e&&e.message==='cancel')return;closeSheet();toast('ZIP konnte nicht erstellt werden',3500)}
 }
 function zipsReady(zips){
-  const canShare=!!(navigator.share&&navigator.canShare&&navigator.canShare({files:[zips[0].file]}));
   const render=()=>{
     const all=zips.every(z=>z.done);
     openSheet(`<h3>${zips.length>1?zips.length+' ZIPs bereit':'ZIP bereit'}</h3>
-      <p>${canShare?'Tippe bei jeder ZIP auf „Teilen“ → „In Dateien sichern“. In der Dateien-App eine ZIP antippen = entpacken.':'Tippe auf „Herunterladen“.'}</p>
+      <p>Tippe auf „Laden“ – die ZIP landet in der Dateien-App unter „Downloads“. Dort antippen = entpacken. Am zuverlässigsten in einem normalen Safari-Tab.</p>
       ${zips.map((z,i)=>`<div class="btnrow" style="align-items:center"><span style="flex:2;font-size:14px">${z.done?'✓ ':''}${zips.length>1?'Teil '+(i+1):'ZIP'} · ${z.count} Dateien · ${fmtSize(z.file.size)}</span>
-        <button data-dl="${i}" style="flex:1">⤓</button><button data-sh="${i}" style="flex:1.4;${z.done?'':'background:#fff;color:#000'}">${canShare?(z.done?'Nochmal':'Teilen'):'Laden'}</button></div>`).join('')}
+        <button data-dl="${i}" style="flex:1.2;${z.done?'':'background:#fff;color:#000'}">${z.done?'Nochmal':'⤓ Laden'}</button></div>`).join('')}
       <div class="btnrow"><button id="zClose">${all?'Fertig':'Schließen'}</button></div>`);
     $('#sheetWrap').onclick=null;$('#zClose').onclick=closeSheet;
     $$('#sheet [data-dl]').forEach(btn=>btn.onclick=()=>{const z=zips[+btn.dataset.dl];downloadFiles([z.file]);z.done=true;render()});
-    $$('#sheet [data-sh]').forEach(btn=>btn.onclick=async()=>{const z=zips[+btn.dataset.sh];
-      if(!canShare){downloadFiles([z.file]);z.done=true;render();return}
-      const r=await shareFiles([z.file]);if(r==='ok'){z.done=true;render()}else if(r==='fail')toast('Teilen fehlgeschlagen – versuche ⤓',3500)});
   };
   render();
 }
