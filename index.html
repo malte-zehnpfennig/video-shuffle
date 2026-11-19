@@ -501,7 +501,7 @@ async function saveItems(ids){
     downloadFiles(files);toast('Download gestartet');return}
   const total=ids.reduce((a,id)=>a+((byId.get(id)||{}).size||0),0);
   openSheet(`<h3>${ids.length} Dateien sichern (${fmtSize(total)})</h3>
-    <p><b>Als ZIP</b>: alles in eine Datei gepackt, in Originalqualität. Ein Tipp zum Start, einer zum Speichern („In Dateien sichern“).</p>
+    <p><b>Als ZIP</b>: automatisch in ZIPs unter 2 GB gepackt (ca. ${Math.max(1,Math.ceil(total/1.95e9))} Stück), Originalqualität. Danach pro ZIP ein Tipp zum Speichern.</p>
     <p><b>Direkt in Fotos</b>: in ${batches.length} Portionen, für jede ein Tipp.</p>
     <div class="btnrow"><button id="cZip" style="background:#fff;color:#000">Als ZIP</button></div>
     <div class="btnrow"><button id="cBatch">Direkt in Fotos</button><button id="cNo">Abbrechen</button></div>`);
@@ -518,55 +518,81 @@ async function crc32Blob(blob,onBytes,isCancelled){let c=0xFFFFFFFF;
   return (c^0xFFFFFFFF)>>>0}
 function dosTime(t){const d=new Date(t||Date.now());return{time:(d.getHours()<<11)|(d.getMinutes()<<5)|(Math.floor(d.getSeconds()/2)),date:(Math.max(0,d.getFullYear()-1980)<<9)|((d.getMonth()+1)<<5)|d.getDate()}}
 let zipRun=0;
+let ZIP_PART_LIMIT=1.95e9; // jede ZIP bleibt unter 2 GB
+function zipDedupe(name,used){name=(name||'datei').replace(/[\\/:*?"<>|]/g,'_');
+  if(used.has(name.toLowerCase())){const dot=name.lastIndexOf('.');const base=dot>0?name.slice(0,dot):name,ext=dot>0?name.slice(dot):'';let n=2;while(used.has((base+' ('+n+')'+ext).toLowerCase()))n++;name=base+' ('+n+')'+ext}
+  used.add(name.toLowerCase());return name}
+/* Baut eine ZIP aus [{name,blob,crc,time,date}]. Unter 4 GB normales ZIP, sonst ZIP64. Dateien werden nur referenziert. */
+function makeZip(entries,fileName){
+  const enc=new TextEncoder();let est=0;entries.forEach(e=>est+=e.blob.size+200);
+  const z64=est>=0xF0000000||entries.length>=0xFFFF;
+  const parts=[],central=[];let offset=0;
+  for(const e of entries){
+    const nb=enc.encode(e.name),sz=e.blob.size;
+    const lh=new DataView(new ArrayBuffer(30+nb.length+(z64?20:0)));
+    lh.setUint32(0,0x04034b50,true);lh.setUint16(4,z64?45:20,true);lh.setUint16(6,0x0800,true);lh.setUint16(8,0,true);lh.setUint16(10,e.time,true);lh.setUint16(12,e.date,true);
+    lh.setUint32(14,e.crc,true);lh.setUint32(18,z64?0xFFFFFFFF:sz,true);lh.setUint32(22,z64?0xFFFFFFFF:sz,true);lh.setUint16(26,nb.length,true);lh.setUint16(28,z64?20:0,true);
+    new Uint8Array(lh.buffer).set(nb,30);
+    if(z64){const x=30+nb.length;lh.setUint16(x,1,true);lh.setUint16(x+2,16,true);lh.setBigUint64(x+4,BigInt(sz),true);lh.setBigUint64(x+12,BigInt(sz),true)}
+    parts.push(lh.buffer,e.blob);
+    const ch=new DataView(new ArrayBuffer(46+nb.length+(z64?28:0)));
+    ch.setUint32(0,0x02014b50,true);ch.setUint16(4,z64?45:20,true);ch.setUint16(6,z64?45:20,true);ch.setUint16(8,0x0800,true);ch.setUint16(10,0,true);ch.setUint16(12,e.time,true);ch.setUint16(14,e.date,true);
+    ch.setUint32(16,e.crc,true);ch.setUint32(20,z64?0xFFFFFFFF:sz,true);ch.setUint32(24,z64?0xFFFFFFFF:sz,true);ch.setUint16(28,nb.length,true);ch.setUint16(30,z64?28:0,true);ch.setUint16(32,0,true);
+    ch.setUint16(34,0,true);ch.setUint16(36,0,true);ch.setUint32(38,0,true);ch.setUint32(42,z64?0xFFFFFFFF:offset,true);
+    new Uint8Array(ch.buffer).set(nb,46);
+    if(z64){const x=46+nb.length;ch.setUint16(x,1,true);ch.setUint16(x+2,24,true);ch.setBigUint64(x+4,BigInt(sz),true);ch.setBigUint64(x+12,BigInt(sz),true);ch.setBigUint64(x+20,BigInt(offset),true)}
+    central.push(ch.buffer);offset+=lh.byteLength+sz;
+  }
+  const cdStart=offset;let cdSize=0;central.forEach(c=>cdSize+=c.byteLength);const n=entries.length;let tail;
+  if(z64){const z=new DataView(new ArrayBuffer(98));
+    z.setUint32(0,0x06064b50,true);z.setBigUint64(4,44n,true);z.setUint16(12,45,true);z.setUint16(14,45,true);
+    z.setBigUint64(24,BigInt(n),true);z.setBigUint64(32,BigInt(n),true);z.setBigUint64(40,BigInt(cdSize),true);z.setBigUint64(48,BigInt(cdStart),true);
+    z.setUint32(56,0x07064b50,true);z.setBigUint64(64,BigInt(cdStart+cdSize),true);z.setUint32(72,1,true);
+    z.setUint32(76,0x06054b50,true);z.setUint16(84,0xFFFF,true);z.setUint16(86,0xFFFF,true);z.setUint32(88,0xFFFFFFFF,true);z.setUint32(92,0xFFFFFFFF,true);tail=z.buffer}
+  else{const z=new DataView(new ArrayBuffer(22));z.setUint32(0,0x06054b50,true);z.setUint16(8,n,true);z.setUint16(10,n,true);z.setUint32(12,cdSize,true);z.setUint32(16,cdStart,true);tail=z.buffer}
+  return new File([...parts,...central,tail],fileName,{type:'application/zip'});
+}
 async function buildZip(ids){
   const run=++zipRun;let cancelled=false;const isC=()=>cancelled||run!==zipRun;
   const total=ids.reduce((a,id)=>a+((byId.get(id)||{}).size||0),0);let doneB=0;
-  openSheet(`<h3>Packe ZIP …</h3><p id="zTxt">Starte …</p><div style="height:6px;border-radius:3px;background:rgba(255,255,255,.15);overflow:hidden;margin:10px 0 4px"><i id="zBar" style="display:block;height:100%;width:0;background:#fff"></i></div><p style="font-size:12.5px">Lass die App dabei geöffnet und den Bildschirm an.</p><div class="btnrow"><button id="zNo">Abbrechen</button></div>`);
+  openSheet(`<h3>Packe ZIPs …</h3><p id="zTxt">Starte …</p><div style="height:6px;border-radius:3px;background:rgba(255,255,255,.15);overflow:hidden;margin:10px 0 4px"><i id="zBar" style="display:block;height:100%;width:0;background:#fff"></i></div><p style="font-size:12.5px">Wird automatisch in ZIPs unter 2 GB aufgeteilt. Lass die App dabei geöffnet und den Bildschirm an.</p><div class="btnrow"><button id="zNo">Abbrechen</button></div>`);
   $('#sheetWrap').onclick=null;$('#zNo').onclick=()=>{cancelled=true;closeSheet()};
-  const enc=new TextEncoder(),parts=[],central=[],used=new Set();let offset=0,count=0;
   try{
+    const groups=[[]];let gSize=0;const used=[new Set()];
     for(let k=0;k<ids.length;k++){
       const m=byId.get(ids[k]);if(!m)continue;let b;try{b=await DB.blob(ids[k])}catch(e){}if(!b)continue;if(isC())return;
-      let name=(m.name||('datei-'+k)).replace(/[\/:*?"<>|]/g,'_');
-      if(used.has(name.toLowerCase())){const dot=name.lastIndexOf('.');const base=dot>0?name.slice(0,dot):name,ext=dot>0?name.slice(dot):'';let n=2;while(used.has((base+' ('+n+')'+ext).toLowerCase()))n++;name=base+' ('+n+')'+ext}
-      used.add(name.toLowerCase());
       const txt=$('#zTxt');if(txt)txt.textContent=`Datei ${k+1} von ${ids.length} · ${fmtSize(doneB)} / ${fmtSize(total)}`;
       const crc=await crc32Blob(b,n=>{doneB+=n;const bar=$('#zBar');if(bar)bar.style.width=(total?doneB/total*100:0)+'%'},isC);
-      const nb=enc.encode(name),size=BigInt(b.size),{time,date}=dosTime(m.modified||m.added);
-      const lh=new DataView(new ArrayBuffer(30+nb.length+20));
-      lh.setUint32(0,0x04034b50,true);lh.setUint16(4,45,true);lh.setUint16(6,0x0800,true);lh.setUint16(8,0,true);lh.setUint16(10,time,true);lh.setUint16(12,date,true);
-      lh.setUint32(14,crc,true);lh.setUint32(18,0xFFFFFFFF,true);lh.setUint32(22,0xFFFFFFFF,true);lh.setUint16(26,nb.length,true);lh.setUint16(28,20,true);
-      new Uint8Array(lh.buffer).set(nb,30);const e=30+nb.length;lh.setUint16(e,1,true);lh.setUint16(e+2,16,true);lh.setBigUint64(e+4,size,true);lh.setBigUint64(e+12,size,true);
-      parts.push(lh.buffer,b);
-      const ch=new DataView(new ArrayBuffer(46+nb.length+28));
-      ch.setUint32(0,0x02014b50,true);ch.setUint16(4,45,true);ch.setUint16(6,45,true);ch.setUint16(8,0x0800,true);ch.setUint16(10,0,true);ch.setUint16(12,time,true);ch.setUint16(14,date,true);
-      ch.setUint32(16,crc,true);ch.setUint32(20,0xFFFFFFFF,true);ch.setUint32(24,0xFFFFFFFF,true);ch.setUint16(28,nb.length,true);ch.setUint16(30,28,true);ch.setUint16(32,0,true);
-      ch.setUint16(34,0,true);ch.setUint16(36,0,true);ch.setUint32(38,0,true);ch.setUint32(42,0xFFFFFFFF,true);
-      new Uint8Array(ch.buffer).set(nb,46);const f=46+nb.length;ch.setUint16(f,1,true);ch.setUint16(f+2,24,true);ch.setBigUint64(f+4,size,true);ch.setBigUint64(f+12,size,true);ch.setBigUint64(f+20,BigInt(offset),true);
-      central.push(ch.buffer);offset+=lh.byteLength+b.size;count++;
+      const need=b.size+200;
+      if(groups[groups.length-1].length&&gSize+need>ZIP_PART_LIMIT){groups.push([]);used.push(new Set());gSize=0}
+      const {time,date}=dosTime(m.modified||m.added);
+      groups[groups.length-1].push({name:zipDedupe(m.name||('datei-'+k),used[used.length-1]),blob:b,crc,time,date});gSize+=need;
     }
-    if(isC())return;if(!count){closeSheet();toast('Nichts zum Packen gefunden');return}
-    const cdStart=offset;let cdSize=0;central.forEach(c=>cdSize+=c.byteLength);
-    const z=new DataView(new ArrayBuffer(56+20+22));
-    z.setUint32(0,0x06064b50,true);z.setBigUint64(4,44n,true);z.setUint16(12,45,true);z.setUint16(14,45,true);z.setUint32(16,0,true);z.setUint32(20,0,true);
-    z.setBigUint64(24,BigInt(count),true);z.setBigUint64(32,BigInt(count),true);z.setBigUint64(40,BigInt(cdSize),true);z.setBigUint64(48,BigInt(cdStart),true);
-    z.setUint32(56,0x07064b50,true);z.setUint32(60,0,true);z.setBigUint64(64,BigInt(cdStart+cdSize),true);z.setUint32(72,1,true);
-    z.setUint32(76,0x06054b50,true);z.setUint16(80,0,true);z.setUint16(82,0,true);z.setUint16(84,0xFFFF,true);z.setUint16(86,0xFFFF,true);z.setUint32(88,0xFFFFFFFF,true);z.setUint32(92,0xFFFFFFFF,true);z.setUint16(96,0,true);
+    if(isC())return;
+    const nonEmpty=groups.filter(g=>g.length);if(!nonEmpty.length){closeSheet();toast('Nichts zum Packen gefunden');return}
     const d=new Date(),stamp=d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
-    const zipFile=new File([...parts,...central,z.buffer],`Shuffle-${stamp}.zip`,{type:'application/zip'});
-    zipReady(zipFile,count);
+    const files=nonEmpty.map((g,i)=>({file:makeZip(g,nonEmpty.length>1?`Shuffle-${stamp}-Teil${i+1}.zip`:`Shuffle-${stamp}.zip`),count:g.length,done:false}));
+    zipsReady(files);
   }catch(e){if(e&&e.message==='cancel')return;closeSheet();toast('ZIP konnte nicht erstellt werden',3500)}
 }
-function zipReady(file,count){
-  const canShare=!!(navigator.share&&navigator.canShare&&navigator.canShare({files:[file]}));
-  openSheet(`<h3>ZIP bereit</h3><p>${count} Dateien · ${fmtSize(file.size)} · Originalqualität</p>
-    <p>${canShare?'Tippe auf „Teilen“ → „In Dateien sichern“. In der Dateien-App die ZIP antippen, dann wird sie entpackt. Um alles in Fotos zu bekommen: dort alle auswählen → Teilen → „Videos sichern“.':'Die ZIP wird heruntergeladen.'}</p>
-    <div class="btnrow"><button id="zClose">Schließen</button>${canShare?'<button id="zDl">Herunterladen</button>':''}<button id="zGo" style="background:#fff;color:#000">${canShare?'Teilen':'Herunterladen'}</button></div>`);
-  $('#sheetWrap').onclick=null;
-  $('#zClose').onclick=closeSheet;
-  if($('#zDl'))$('#zDl').onclick=()=>downloadFiles([file]);
-  $('#zGo').onclick=async()=>{if(!canShare){downloadFiles([file]);return}const r=await shareFiles([file]);if(r==='ok')closeSheet();else if(r==='fail'){toast('Teilen fehlgeschlagen – versuche „Herunterladen“',3500)}};
+function zipsReady(zips){
+  const canShare=!!(navigator.share&&navigator.canShare&&navigator.canShare({files:[zips[0].file]}));
+  const render=()=>{
+    const all=zips.every(z=>z.done);
+    openSheet(`<h3>${zips.length>1?zips.length+' ZIPs bereit':'ZIP bereit'}</h3>
+      <p>${canShare?'Tippe bei jeder ZIP auf „Teilen“ → „In Dateien sichern“. In der Dateien-App eine ZIP antippen = entpacken.':'Tippe auf „Herunterladen“.'}</p>
+      ${zips.map((z,i)=>`<div class="btnrow" style="align-items:center"><span style="flex:2;font-size:14px">${z.done?'✓ ':''}${zips.length>1?'Teil '+(i+1):'ZIP'} · ${z.count} Dateien · ${fmtSize(z.file.size)}</span>
+        <button data-dl="${i}" style="flex:1">⤓</button><button data-sh="${i}" style="flex:1.4;${z.done?'':'background:#fff;color:#000'}">${canShare?(z.done?'Nochmal':'Teilen'):'Laden'}</button></div>`).join('')}
+      <div class="btnrow"><button id="zClose">${all?'Fertig':'Schließen'}</button></div>`);
+    $('#sheetWrap').onclick=null;$('#zClose').onclick=closeSheet;
+    $$('#sheet [data-dl]').forEach(btn=>btn.onclick=()=>{const z=zips[+btn.dataset.dl];downloadFiles([z.file]);z.done=true;render()});
+    $$('#sheet [data-sh]').forEach(btn=>btn.onclick=async()=>{const z=zips[+btn.dataset.sh];
+      if(!canShare){downloadFiles([z.file]);z.done=true;render();return}
+      const r=await shareFiles([z.file]);if(r==='ok'){z.done=true;render()}else if(r==='fail')toast('Teilen fehlgeschlagen – versuche ⤓',3500)});
+  };
+  render();
 }
+
 async function runBatches(batches,i,run,prepared){
   if(run!==batchRun)return;
   const n=batches.length,ids=batches[i];
