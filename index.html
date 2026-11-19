@@ -278,35 +278,60 @@ function thumbUrl(m){if(!m.thumb)return null;if(!thumbUrls.has(m.id)){try{thumbU
 /* ---------- Import ---------- */
 function makeThumb(file,kind){return new Promise(resolve=>{
   let url;try{url=URL.createObjectURL(file)}catch(e){return resolve({})}
-  let finished=false;const done=r=>{if(finished)return;finished=true;clearTimeout(to);try{URL.revokeObjectURL(url)}catch(e){}resolve(r)};
-  const to=setTimeout(()=>done({}),12000);
+  let v=null,img=null,finished=false;
+  // Alles sauber freigeben – sonst sammeln sich Video-Decoder an und jeder Import wird langsamer
+  const cleanup=()=>{if(v){v.onloadedmetadata=v.onseeked=v.onerror=null;try{v.pause();v.removeAttribute('src');v.load()}catch(e){}v=null}
+    if(img){img.onload=img.onerror=null;img.src='';img=null}try{URL.revokeObjectURL(url)}catch(e){}};
+  const done=r=>{if(finished)return;finished=true;clearTimeout(to);cleanup();resolve(r)};
+  const to=setTimeout(()=>done({}),6000);
   const draw=(el,w,h,extra)=>{try{if(!w||!h)return done(extra);const sc=360/Math.max(w,h);const c=document.createElement('canvas');c.width=Math.max(1,Math.round(w*sc));c.height=Math.max(1,Math.round(h*sc));
-    c.getContext('2d').drawImage(el,0,0,c.width,c.height);c.toBlob(b=>done(Object.assign({thumb:b||null,width:w,height:h},extra)),'image/jpeg',.72)}catch(e){done(Object.assign({width:w,height:h},extra))}};
-  if(kind==='photo'){const img=new Image();img.onload=()=>draw(img,img.naturalWidth,img.naturalHeight,{});img.onerror=()=>done({});img.src=url}
-  else{const v=document.createElement('video');v.muted=true;v.playsInline=true;v.setAttribute('playsinline','');v.preload='auto';
+    c.getContext('2d').drawImage(el,0,0,c.width,c.height);c.toBlob(b=>{c.width=c.height=0;done(Object.assign({thumb:b||null,width:w,height:h},extra))},'image/jpeg',.72)}catch(e){done(Object.assign({width:w,height:h},extra))}};
+  if(kind==='photo'){img=new Image();img.decoding='async';img.onload=()=>draw(img,img.naturalWidth,img.naturalHeight,{});img.onerror=()=>done({});img.src=url}
+  else{v=document.createElement('video');v.muted=true;v.playsInline=true;v.setAttribute('playsinline','');v.preload='metadata';
     v.onloadedmetadata=()=>{const d=v.duration;try{v.currentTime=Math.min(1,isFinite(d)?d/3:.5)}catch(e){draw(v,v.videoWidth,v.videoHeight,{duration:d})}};
     v.onseeked=()=>draw(v,v.videoWidth,v.videoHeight,{duration:v.duration});
     v.onerror=()=>done({});v.src=url;try{v.load()}catch(e){}}
 })}
+const pause0=()=>new Promise(r=>setTimeout(r,0));
 async function importFiles(list){
   const files=[...list].filter(kindOf);
   if(!files.length){toast('Keine Videos oder Fotos erkannt');return}
   try{if(navigator.storage&&navigator.storage.persist)navigator.storage.persist().catch(()=>{})}catch(e){}
+  if(cur>=0)deactivate(cur);
   const prog=$('#progress'),pt=$('#progText'),pb=$('#progBar');prog.hidden=false;
   let ok=0,fail=0,quota=false;
   for(let i=0;i<files.length;i++){
     const f=files[i];pt.textContent=`Importiere ${i+1} von ${files.length} …`;pb.style.width=(i/files.length*100)+'%';
-    const kind=kindOf(f);const info=await makeThumb(f,kind);
-    const m=Object.assign({id:uid(),name:f.name||(kind==='video'?'Video':'Foto'),type:f.type||'',kind,size:f.size,added:Date.now(),modified:f.lastModified||null,fav:false},info);
+    const kind=kindOf(f);
+    // Vorschaubilder werden erst NACH dem Import im Hintergrund erzeugt → Import bleibt gleich schnell
+    const m={id:uid(),name:f.name||(kind==='video'?'Video':'Foto'),type:f.type||'',kind,size:f.size,added:Date.now(),modified:f.lastModified||null,fav:false};
     try{await DB.add(m,f)}catch(e){
       if(e&&/quota/i.test(e.name+e.message)){quota=true;fail++;continue}
+      // Notlösung nur für kleine Dateien (große würden komplett in den Arbeitsspeicher geladen)
+      if(f.size>150e6){fail++;continue}
       try{const b=new Blob([await f.arrayBuffer()],{type:f.type});await DB.add(m,b)}catch(e2){fail++;if(e2&&/quota/i.test(e2.name+e2.message))quota=true;continue}
     }
     items.push(m);byId.set(m.id,m);ok++;
+    if(i%5===4)await pause0();
   }
   pb.style.width='100%';setTimeout(()=>prog.hidden=true,200);
-  toast(quota?`${ok} hinzugefügt – Speicher voll, ${fail} übersprungen`:fail?`${ok} hinzugefügt, ${fail} fehlgeschlagen`:`${ok} ${ok===1?'Datei':'Dateien'} hinzugefügt`,3200);
-  renderGrid();resetFeed();
+  let msg=`${ok} ${ok===1?'Datei':'Dateien'} hinzugefügt`;if(fail)msg+=quota?`, Speicher voll – ${fail} nicht gespeichert`:`, ${fail} fehlgeschlagen`;
+  toast(msg,3600);
+  renderGrid();resetFeed();thumbQueue();
+}
+/* Vorschaubilder nachträglich, eins nach dem anderen, im Hintergrund */
+let thumbBusy=false;
+async function thumbQueue(){
+  if(thumbBusy)return;thumbBusy=true;
+  try{
+    for(;;){
+      const m=items.find(x=>!x.thumb&&!x.thumbTried);if(!m)break;
+      m.thumbTried=true;let b;try{b=await DB.blob(m.id)}catch(e){}
+      if(b){const info=await makeThumb(b,m.kind);Object.assign(m,info);try{await DB.putMeta(m)}catch(e){}
+        if(!$('#lib').hidden){const c=document.querySelector(`.cell[data-id="${CSS.escape(m.id)}"]`);const u=thumbUrl(m);if(c&&u&&!c.querySelector('img')){const ph=c.querySelector('.ph');if(ph)ph.outerHTML=`<img src="${u}" alt="" loading="lazy">`}}}
+      await new Promise(r=>setTimeout(r,150));
+    }
+  }finally{thumbBusy=false}
 }
 
 /* ---------- Feed ---------- */
@@ -501,11 +526,12 @@ async function saveItems(ids){
     downloadFiles(files);toast('Download gestartet');return}
   const total=ids.reduce((a,id)=>a+((byId.get(id)||{}).size||0),0);
   openSheet(`<h3>${ids.length} Dateien sichern (${fmtSize(total)})</h3>
-    <p><b>Als ZIP</b>: automatisch in ZIPs unter 2 GB gepackt (ca. ${Math.max(1,Math.ceil(total/1.95e9))} Stück), Originalqualität. Danach pro ZIP ein Tipp zum Speichern.</p>
+    <p><b>Eine ZIP</b>: alles in einer Datei, Originalqualität. Danach ein Tipp → „In Dateien sichern“.</p>
+    <p><b>ZIPs unter 2 GB</b>: automatisch aufgeteilt (ca. ${Math.max(1,Math.ceil(total/1.95e9))} Stück), pro ZIP ein Tipp.</p>
     <p><b>Direkt in Fotos</b>: in ${batches.length} Portionen, für jede ein Tipp.</p>
-    <div class="btnrow"><button id="cZip" style="background:#fff;color:#000">Als ZIP</button></div>
+    <div class="btnrow"><button id="cZip" style="background:#fff;color:#000">Eine ZIP</button><button id="cZip2">ZIPs unter 2 GB</button></div>
     <div class="btnrow"><button id="cBatch">Direkt in Fotos</button><button id="cNo">Abbrechen</button></div>`);
-  $('#cZip').onclick=()=>buildZip(ids);
+  $('#cZip').onclick=()=>buildZip(ids,Infinity);$('#cZip2').onclick=()=>buildZip(ids,1.95e9);
   $('#cBatch').onclick=()=>runBatches(batches,0,++batchRun,null);
   $('#cNo').onclick=closeSheet;
 }
@@ -552,10 +578,10 @@ function makeZip(entries,fileName){
   else{const z=new DataView(new ArrayBuffer(22));z.setUint32(0,0x06054b50,true);z.setUint16(8,n,true);z.setUint16(10,n,true);z.setUint32(12,cdSize,true);z.setUint32(16,cdStart,true);tail=z.buffer}
   return new File([...parts,...central,tail],fileName,{type:'application/zip'});
 }
-async function buildZip(ids){
+async function buildZip(ids,limit){const partLimit=limit||Infinity;
   const run=++zipRun;let cancelled=false;const isC=()=>cancelled||run!==zipRun;
   const total=ids.reduce((a,id)=>a+((byId.get(id)||{}).size||0),0);let doneB=0;
-  openSheet(`<h3>Packe ZIPs …</h3><p id="zTxt">Starte …</p><div style="height:6px;border-radius:3px;background:rgba(255,255,255,.15);overflow:hidden;margin:10px 0 4px"><i id="zBar" style="display:block;height:100%;width:0;background:#fff"></i></div><p style="font-size:12.5px">Wird automatisch in ZIPs unter 2 GB aufgeteilt. Lass die App dabei geöffnet und den Bildschirm an.</p><div class="btnrow"><button id="zNo">Abbrechen</button></div>`);
+  openSheet(`<h3>Packe ZIPs …</h3><p id="zTxt">Starte …</p><div style="height:6px;border-radius:3px;background:rgba(255,255,255,.15);overflow:hidden;margin:10px 0 4px"><i id="zBar" style="display:block;height:100%;width:0;background:#fff"></i></div><p style="font-size:12.5px">Lass die App dabei geöffnet und den Bildschirm an.</p><div class="btnrow"><button id="zNo">Abbrechen</button></div>`);
   $('#sheetWrap').onclick=null;$('#zNo').onclick=()=>{cancelled=true;closeSheet()};
   try{
     const groups=[[]];let gSize=0;const used=[new Set()];
@@ -564,7 +590,7 @@ async function buildZip(ids){
       const txt=$('#zTxt');if(txt)txt.textContent=`Datei ${k+1} von ${ids.length} · ${fmtSize(doneB)} / ${fmtSize(total)}`;
       const crc=await crc32Blob(b,n=>{doneB+=n;const bar=$('#zBar');if(bar)bar.style.width=(total?doneB/total*100:0)+'%'},isC);
       const need=b.size+200;
-      if(groups[groups.length-1].length&&gSize+need>ZIP_PART_LIMIT){groups.push([]);used.push(new Set());gSize=0}
+      if(groups[groups.length-1].length&&gSize+need>partLimit){groups.push([]);used.push(new Set());gSize=0}
       const {time,date}=dosTime(m.modified||m.added);
       groups[groups.length-1].push({name:zipDedupe(m.name||('datei-'+k),used[used.length-1]),blob:b,crc,time,date});gSize+=need;
     }
@@ -651,7 +677,7 @@ io=new IntersectionObserver(es=>{es.forEach(e=>{if(e.isIntersecting&&e.intersect
   applyS();$$('.chip').forEach(c=>c.classList.toggle('on',c.dataset.f===filter));
   try{db=await openDB()}catch(e){db=null;setTimeout(()=>toast('Lokaler Speicher nicht verfügbar – Dateien bleiben nur bis zum Schließen',4500),300)}
   try{items=await DB.all()}catch(e){items=[]}
-  indexItems();resetFeed();
+  indexItems();resetFeed();setTimeout(thumbQueue,1500);
 })();
 })();
 </script>
