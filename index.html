@@ -361,7 +361,7 @@ function makeSlide(i,id){
   s.querySelector('.pp').addEventListener('click',e=>{e.stopPropagation();togglePlay(s)});
   const r=s.querySelector('input');
   ['pointerdown','touchstart','mousedown'].forEach(ev=>r.addEventListener(ev,e=>{e.stopPropagation();s.classList.add('dragging');showUI(s,false)},{passive:true}));
-  r.addEventListener('input',()=>{const st=mounted.get(+s.dataset.i);if(st&&st.el&&st.el.tagName==='VIDEO'&&isFinite(st.el.duration)){st.el.currentTime=r.value/1000*st.el.duration;updSeek(s,st.el,true)}});
+  r.addEventListener('input',()=>{const st=mounted.get(+s.dataset.i);const v=st&&st.video;if(v&&isFinite(v.duration)){v.currentTime=r.value/1000*v.duration;updSeek(s,v,true)}});
   r.addEventListener('change',()=>{s.classList.remove('dragging');showUI(s,true)});
   r.addEventListener('click',e=>e.stopPropagation());
   let last=0,tt=null;
@@ -370,14 +370,20 @@ function makeSlide(i,id){
   return s;
 }
 function appendIds(ids){const frag=document.createDocumentFragment(),els=[];ids.forEach(id=>{const i=queue.length;queue.push(id);const s=makeSlide(i,id);els.push(s);frag.appendChild(s)});feed.appendChild(frag);els.forEach(s=>io.observe(s))}
-/* Jede Seite hat ihr eigenes Video (stabil). Ton: wird nie mehr dauerhaft ausgeschaltet. */
+/* Stabilität beim schnellen Scrollen:
+   – Es existiert immer höchstens EIN Video-Element (nur für das aktuelle Video).
+   – Nachbarn zeigen nur ihr Vorschaubild.
+   – Erst wenn das Scrollen zur Ruhe kommt, wird geladen und abgespielt. */
 let forcedMute=false;
-const curVideo=()=>{const st=mounted.get(cur);return st&&st.el&&st.el.tagName==='VIDEO'?st.el:null};
+const curVideo=()=>{const st=mounted.get(cur);return st&&st.video?st.video:null};
 function onGesture(){if(forcedMute&&!muted){const v=curVideo();if(v){v.muted=false;if(v.paused&&!slideEl(cur).classList.contains('paused'))v.play().catch(()=>{})}forcedMute=false;updMuteBtn()}}
 document.addEventListener('click',onGesture,true);
 document.addEventListener('touchend',onGesture,{capture:true,passive:true});
+function killVideo(st){const v=st&&st.video;if(!v)return;st.video=null;
+  v.onloadedmetadata=v.ontimeupdate=v.onended=v.onerror=null;
+  try{v.pause();v.removeAttribute('src');v.load()}catch(e){}v.remove()}
 function unmount(i){const st=mounted.get(i);if(!st)return;mounted.delete(i);const s=slideEl(i);
-  if(st.el){if(st.el.tagName==='VIDEO'){try{st.el.pause();st.el.removeAttribute('src');st.el.load()}catch(e){}}st.el.remove()}
+  killVideo(st);if(st.el){if(st.el.tagName==='IMG')st.el.src='';st.el.remove()}
   if(st.url)try{URL.revokeObjectURL(st.url)}catch(e){}
   if(s){s.querySelector('.media').innerHTML='<div class="spinner"></div>';s.classList.remove('paused','ui','timed')}}
 function unmountAll(){[...mounted.keys()].forEach(unmount)}
@@ -388,18 +394,21 @@ async function mount(i){
   const box=slideEl(i)&&slideEl(i).querySelector('.media');if(!box)return;
   if(!blob||!m){box.innerHTML='<div style="color:#999">Datei nicht gefunden</div>';return}
   st.url=URL.createObjectURL(blob);st.kind=m.kind;let el;
-  if(m.kind==='video'){el=document.createElement('video');el.playsInline=true;el.setAttribute('playsinline','');el.setAttribute('webkit-playsinline','');
-    el.muted=true;el.preload=(i===cur)?'auto':'metadata';el.loop=S.end==='loop';el.src=st.url;
-    const s=slideEl(i);
-    el.addEventListener('timeupdate',()=>{if(!s.classList.contains('dragging'))updSeek(s,el)});
-    el.addEventListener('loadedmetadata',()=>{updSeek(s,el);if(!m.duration&&isFinite(el.duration)){m.duration=el.duration;DB.putMeta(m).catch(()=>{})}});
-    el.addEventListener('ended',()=>{if(S.end==='next'&&i===cur)go(1)});
-    el.addEventListener('error',()=>{if(i===cur)toast('Dieses Videoformat kann der Browser nicht abspielen')});
-  }else{el=document.createElement('img');el.decoding='async';el.alt='';el.src=st.url;
+  if(m.kind==='video'){el=document.createElement('img');el.className='poster';el.alt='';const u=thumbUrl(m);if(u)el.src=u;else el.style.visibility='hidden'}
+  else{el=document.createElement('img');el.decoding='async';el.alt='';el.src=st.url;
     el.addEventListener('error',()=>{if(i===cur)toast('Dieses Bildformat wird hier nicht unterstützt')})}
   st.el=el;box.innerHTML='';box.appendChild(el);
   if(i===cur)activate(i);
 }
+function makeVideo(i,st){
+  const s=slideEl(i),m=byId.get(queue[i]);if(!s||!st.url)return null;
+  const v=document.createElement('video');v.playsInline=true;v.setAttribute('playsinline','');v.setAttribute('webkit-playsinline','');
+  v.muted=true;v.preload='auto';v.loop=S.end==='loop';
+  v.ontimeupdate=()=>{if(!s.classList.contains('dragging'))updSeek(s,v)};
+  v.onloadedmetadata=()=>{updSeek(s,v);if(m&&!m.duration&&isFinite(v.duration)){m.duration=v.duration;DB.putMeta(m).catch(()=>{})}};
+  v.onended=()=>{if(S.end==='next'&&i===cur)go(1)};
+  v.onerror=()=>{if(i===cur&&v.getAttribute('src'))toast('Dieses Videoformat kann der Browser nicht abspielen')};
+  v.src=st.url;s.querySelector('.media').appendChild(v);st.video=v;return v}
 function updSeek(s,v,force){const d=v.duration,t=v.currentTime;const r=s.querySelector('.seek input');const p=isFinite(d)&&d>0?t/d:0;
   if(force!==true)r.value=Math.round(p*1000);r.style.setProperty('--p',(p*100)+'%');s.querySelector('.seek .t').textContent=fmtTime(t)+' / '+fmtTime(d)}
 
@@ -412,11 +421,11 @@ function activate(i){
   if(S.name==='auto')showUI(s,true);else{clearTimeout(uiT);s.classList.remove('ui')}updMuteBtn();
   if(!st||!st.el)return;
   s.classList.remove('paused');setPPIcon(s);
-  if(st.el.tagName==='VIDEO'){st.el.preload='auto';playVideo(st.el,s)}else startPhoto(s);
+  if(st.kind==='video'){const v=st.video||makeVideo(i,st);if(v)playVideo(v,s)}else startPhoto(s);
 }
 function deactivate(i){const s=slideEl(i),st=mounted.get(i);if(!s)return;s.classList.remove('ui','paused','timed');
   const bar=s.querySelector('.pbar i');bar.classList.remove('run');bar.onanimationend=null;
-  if(st&&st.el&&st.el.tagName==='VIDEO'){try{st.el.pause()}catch(e){}}}
+  if(st)killVideo(st);}
 function playVideo(v,s){forcedMute=false;v.loop=S.end==='loop';v.muted=muted;const p=v.play();
   // Falls iOS den Ton blockiert: nur DIESES Mal stumm starten – die Ton-Einstellung bleibt an, beim nächsten Tippen kommt der Ton zurück
   if(p&&p.catch)p.catch(()=>{if(!v.muted){v.muted=true;forcedMute=true;updMuteBtn();v.play().catch(()=>{s.classList.add('paused');setPPIcon(s)})}else{s.classList.add('paused');setPPIcon(s)}})}
@@ -428,10 +437,14 @@ function setCurrent(i){
   if(i===cur||i<0||i>=queue.length)return;
   if(cur>=0)deactivate(cur);cur=i;
   if(i>=queue.length-3&&pool.length)appendIds(nextBatch());
-  for(let j=i-1;j<=i+2;j++)mount(j);
-  [...mounted.keys()].forEach(k=>{if(k<i-2||k>i+3)unmount(k)});
+  for(let j=i-1;j<=i+1;j++)mount(j);
+  [...mounted.keys()].forEach(k=>{if(k<i-1||k>i+1)unmount(k)});
   activate(i);
 }
+// Erst handeln, wenn das Scrollen kurz still steht – beim schnellen Wischen wird nichts geladen
+let settleT=null;
+function settle(){if(!$('#lib').hidden)return;const h=feed.clientHeight||1;const i=Math.round(feed.scrollTop/h);if(i!==cur)setCurrent(i)}
+feed.addEventListener('scroll',()=>{clearTimeout(settleT);settleT=setTimeout(settle,180)},{passive:true});
 function go(d){const s=slideEl(cur+d);if(s)s.scrollIntoView({behavior:'smooth',block:'start'})}
 function resetFeed(startId){
   if(cur>=0)deactivate(cur);unmountAll();feed.innerHTML='';queue=[];cur=-1;
@@ -446,9 +459,9 @@ function singleTap(s){
   else showUI(s,true)}
 function setPPIcon(s){const b=s.querySelector('.pp');if(b){const p=s.classList.contains('paused');b.innerHTML=p?IC.play:IC.pause;b.setAttribute('aria-label',p?'Abspielen':'Pause')}}
 function togglePlay(s){const i=+s.dataset.i,st=mounted.get(i);if(!st||!st.el||i!==cur)return;
-  if(st.el.tagName==='VIDEO'){
-    if(st.el.paused){s.classList.remove('paused');playVideo(st.el,s);showUI(s,true)}
-    else{st.el.pause();s.classList.add('paused');showUI(s,false)}
+  if(st.kind==='video'){const v=st.video;if(!v)return;
+    if(v.paused){s.classList.remove('paused');playVideo(v,s);showUI(s,true)}
+    else{v.pause();s.classList.add('paused');showUI(s,false)}
   }else{
     const bar=s.querySelector('.pbar i');
     if(s.classList.contains('paused')){s.classList.remove('paused');bar.style.animationPlayState='running';showUI(s,true)}
@@ -515,7 +528,7 @@ async function removeItems(ids){try{await DB.del(ids)}catch(e){toast('Löschen f
   renderGrid();resetFeed();if($('#lib').hidden===false&&cur>=0)deactivate(cur);toast(`${ids.length} gelöscht`)}
 $$('.seg').forEach(sg=>sg.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;const k=sg.dataset.k;S[k]=k==='photoSec'?+b.dataset.v:b.dataset.v;saveS();applyS();renderGrid()}));
 function applyS(){app.classList.toggle('fit-916',S.fit==='916');document.documentElement.style.setProperty('--fit',S.fit==='contain'?'contain':'cover');
-  app.classList.toggle('name-always',S.name==='always');mounted.forEach(st=>{if(st.el&&st.el.tagName==='VIDEO')st.el.loop=S.end==='loop'})}
+  app.classList.toggle('name-always',S.name==='always');mounted.forEach(st=>{if(st.video)st.video.loop=S.end==='loop'})}
 
 /* ---------- Sheets ---------- */
 function openSheet(html){const w=$('#sheetWrap');$('#sheet').innerHTML=html;w.hidden=false;return w}
@@ -689,7 +702,7 @@ document.addEventListener('visibilitychange',()=>{const v=curVideo();if(document
   else if(!document.hidden&&$('#lib').hidden&&cur>=0&&!slideEl(cur).classList.contains('paused'))activate(cur)});
 
 /* ---------- Start ---------- */
-io=new IntersectionObserver(es=>{es.forEach(e=>{if(e.isIntersecting&&e.intersectionRatio>=.6&&$('#lib').hidden)setCurrent(+e.target.dataset.i)})},{root:feed,threshold:[.6]});
+io={observe(){}};
 (async()=>{
   applyS();$$('.chip').forEach(c=>c.classList.toggle('on',c.dataset.f===filter));
   try{db=await openDB()}catch(e){db=null;setTimeout(()=>toast('Lokaler Speicher nicht verfügbar – Dateien bleiben nur bis zum Schließen',4500),300)}
